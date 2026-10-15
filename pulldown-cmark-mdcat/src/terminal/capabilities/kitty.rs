@@ -138,7 +138,12 @@ impl KittyImageData {
 }
 
 impl KittyImageData {
-    fn write_to(&self, writer: &mut dyn Write, move_cursor: bool) -> Result<(), Error> {
+    fn write_to(
+        &self,
+        writer: &mut dyn Write,
+        move_cursor: bool,
+        cells: Option<(u16, u16)>,
+    ) -> Result<(), Error> {
         let image_data = STANDARD.encode(self.data());
         let image_data_chunks = image_data.as_bytes().chunks(4096);
         let number_of_chunks = image_data_chunks.len();
@@ -170,6 +175,11 @@ impl KittyImageData {
                 write!(writer, "\x1b_Ga=T,t=d,I=1,f={f}")?;
                 if let Some(size) = self.size() {
                     write!(writer, ",s={},v={}", size.x, size.y)?;
+                }
+                // c and r make kitty scale the image to exactly this many columns and rows, so
+                // it keeps its size relative to the text when the font size changes.
+                if let Some((columns, rows)) = cells {
+                    write!(writer, ",c={columns},r={rows}")?;
                 }
                 if !move_cursor {
                     write!(writer, ",C=1")?;
@@ -352,7 +362,23 @@ impl KittyGraphicsProtocol {
             data: png_data,
             pixel_size: None,
         }
-        .write_to(writer, move_cursor)
+        .write_to(writer, move_cursor, None)
+    }
+
+    /// Write raw PNG bytes inline to the terminal, scaled to `columns` × `rows` cells.
+    pub(crate) fn write_png_data_in_cells(
+        &self,
+        writer: &mut dyn Write,
+        png_data: Vec<u8>,
+        move_cursor: bool,
+        columns: u16,
+        rows: u16,
+    ) -> std::io::Result<()> {
+        KittyImageData::Png {
+            data: png_data,
+            pixel_size: None,
+        }
+        .write_to(writer, move_cursor, Some((columns, rows)))
     }
 }
 
@@ -372,6 +398,6 @@ impl InlineImageProtocol for KittyGraphicsProtocol {
             mime_data.mime_type
         );
         let image = self.render(mime_data, terminal_size)?;
-        image.write_to(writer, true)
+        image.write_to(writer, true, None)
     }
 }

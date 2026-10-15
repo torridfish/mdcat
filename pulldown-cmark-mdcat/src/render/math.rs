@@ -188,8 +188,9 @@ pub(crate) fn png_dimensions(data: &[u8]) -> (u32, u32) {
     (w, h)
 }
 
-fn pad_png_vertically(data: &[u8], top: u32, bottom: u32) -> Option<Vec<u8>> {
-    if top == 0 && bottom == 0 {
+/// Pad a PNG with transparent pixels above, below and to the right.
+fn pad_png(data: &[u8], top: u32, bottom: u32, right: u32) -> Option<Vec<u8>> {
+    if top == 0 && bottom == 0 && right == 0 {
         return Some(data.to_vec());
     }
 
@@ -225,12 +226,15 @@ fn pad_png_vertically(data: &[u8], top: u32, bottom: u32) -> Option<Vec<u8>> {
         png::ColorType::Indexed => return None,
     }
 
-    let width = info.width;
+    let width = info.width + right;
     let height = info.height + top + bottom;
     let row_len = width as usize * 4;
+    let src_row_len = info.width as usize * 4;
     let mut padded = vec![0; row_len * height as usize];
-    let top_bytes = row_len * top as usize;
-    padded[top_bytes..top_bytes + rgba.len()].copy_from_slice(&rgba);
+    for (y, src_row) in rgba.chunks_exact(src_row_len).enumerate() {
+        let start = (top as usize + y) * row_len;
+        padded[start..start + src_row_len].copy_from_slice(src_row);
+    }
 
     let mut output = Vec::new();
     {
@@ -254,11 +258,17 @@ pub(crate) struct MathImage {
 }
 
 /// Render math to a PNG image using RaTeX.
+///
+/// `scale` renders the image at that multiple of the terminal's cell resolution.  When the
+/// terminal knows its cell size the image is padded to whole cells, so a protocol that places
+/// images by cell count (kitty's `c`/`r`) shows it at the intended size, and keeps it sharp
+/// when the terminal font is enlarged later.
 pub(crate) fn render_math_png(
     input: &str,
     display_mode: bool,
     terminal_size: &TerminalSize,
     math_style: &anstyle::Style,
+    scale: u32,
 ) -> Option<MathImage> {
     use ratex_layout::{layout, to_display_list, LayoutOptions};
     use ratex_parser::parse;
@@ -283,38 +293,46 @@ pub(crate) fn render_math_png(
         font_size,
         padding: 0.0,
         background_color: Color::new(0.0, 0.0, 0.0, 0.0),
-        device_pixel_ratio: 1.0,
+        device_pixel_ratio: scale as f32,
         ..RenderOptions::default()
     };
     let mut png = render_to_png(&display_list, &render_opts).ok()?;
-    let (px_w, mut px_h) = png_dimensions(&png);
-    let baseline_px = (display_list.height as f32 * font_size).round().max(0.0) as u32;
+    let (mut px_w, mut px_h) = png_dimensions(&png);
+    let baseline_px = (display_list.height as f32 * font_size * scale as f32)
+        .round()
+        .max(0.0) as u32;
     #[cfg(test)]
     let mut padded_baseline_px = baseline_px;
 
-    if !display_mode {
-        if let Some(cell) = terminal_size.cell {
-            let target_baseline = (cell.y as f32 * INLINE_BASELINE_RATIO).round() as u32;
-            let top_pad = target_baseline.saturating_sub(baseline_px);
-            let unrounded_height = top_pad + px_h;
-            let bottom_pad = if unrounded_height < cell.y {
-                cell.y - unrounded_height
-            } else {
-                (cell.y - (unrounded_height % cell.y)) % cell.y
-            };
-            png = pad_png_vertically(&png, top_pad, bottom_pad)?;
-            px_h += top_pad + bottom_pad;
-            #[cfg(test)]
-            {
-                padded_baseline_px += top_pad;
-            }
+    if let Some(cell) = terminal_size.cell {
+        // Work in image pixels: one terminal cell spans `scale` image pixels per cell pixel.
+        let (cell_w, cell_h) = (cell.x * scale, cell.y * scale);
+        let top_pad = if display_mode {
+            0
+        } else {
+            let target_baseline = (cell_h as f32 * INLINE_BASELINE_RATIO).round() as u32;
+            target_baseline.saturating_sub(baseline_px)
+        };
+        let unrounded_height = top_pad + px_h;
+        let bottom_pad = if unrounded_height < cell_h {
+            cell_h - unrounded_height
+        } else {
+            (cell_h - (unrounded_height % cell_h)) % cell_h
+        };
+        let right_pad = (cell_w - (px_w % cell_w)) % cell_w;
+        png = pad_png(&png, top_pad, bottom_pad, right_pad)?;
+        px_w += right_pad;
+        px_h += top_pad + bottom_pad;
+        #[cfg(test)]
+        {
+            padded_baseline_px += top_pad;
         }
     }
 
     let (width_columns, height_rows) = if let Some(cell) = terminal_size.cell {
         (
-            ((px_w as f32 / cell.x as f32).ceil() as u16).max(1),
-            ((px_h as f32 / cell.y as f32).ceil() as u16).max(1),
+            ((px_w as f32 / (cell.x * scale) as f32).ceil() as u16).max(1),
+            ((px_h as f32 / (cell.y * scale) as f32).ceil() as u16).max(1),
         )
     } else {
         ((input.len() as u16).max(1), 1)
@@ -383,7 +401,7 @@ mod tests {
     fn render_png_simple() {
         let math_style = anstyle::Style::new().fg_color(Some(anstyle::AnsiColor::Yellow.into()));
         let terminal_size = crate::terminal::TerminalSize::default();
-        let img = super::render_math_png(r"x^2 + y^2", false, &terminal_size, &math_style);
+        let img = super::render_math_png(r"x^2 + y^2", false, &terminal_size, &math_style, 1);
         assert!(img.is_some());
         let img = img.unwrap();
         assert!(img.png.len() > 100);
@@ -403,10 +421,11 @@ mod tests {
             cell: Some(PixelSize { x: 10, y: 20 }),
         };
 
-        let alpha = super::render_math_png(r"\alpha", false, &terminal_size, &math_style).unwrap();
-        let beta = super::render_math_png(r"\beta", false, &terminal_size, &math_style).unwrap();
+        let alpha =
+            super::render_math_png(r"\alpha", false, &terminal_size, &math_style, 1).unwrap();
+        let beta = super::render_math_png(r"\beta", false, &terminal_size, &math_style, 1).unwrap();
         let field =
-            super::render_math_png(r"\mathbb{F}", false, &terminal_size, &math_style).unwrap();
+            super::render_math_png(r"\mathbb{F}", false, &terminal_size, &math_style, 1).unwrap();
 
         assert_eq!(alpha.baseline_pixels, 16);
         assert_eq!(beta.baseline_pixels, 16);
@@ -417,5 +436,35 @@ mod tests {
         assert_eq!(alpha.height_rows, 1);
         assert_eq!(beta.height_rows, 1);
         assert_eq!(field.height_rows, 1);
+    }
+
+    #[test]
+    fn render_png_scaled_fills_whole_cells() {
+        use crate::terminal::PixelSize;
+
+        let math_style = anstyle::Style::new().fg_color(Some(anstyle::AnsiColor::Yellow.into()));
+        let terminal_size = crate::terminal::TerminalSize {
+            columns: 80,
+            rows: 24,
+            pixels: Some(PixelSize { x: 800, y: 480 }),
+            cell: Some(PixelSize { x: 10, y: 20 }),
+        };
+
+        for (input, display_mode) in [(r"\alpha", false), (r"\frac{a}{b} + \sqrt{x^2}", true)] {
+            let single =
+                super::render_math_png(input, display_mode, &terminal_size, &math_style, 1)
+                    .unwrap();
+            let double =
+                super::render_math_png(input, display_mode, &terminal_size, &math_style, 2)
+                    .unwrap();
+            let (w, h) = super::png_dimensions(&double.png);
+            assert_eq!(w, u32::from(double.width_columns) * 20, "{input}");
+            assert_eq!(h, u32::from(double.height_rows) * 40, "{input}");
+            assert_eq!(single.height_rows, double.height_rows, "{input}");
+            assert!(
+                single.width_columns.abs_diff(double.width_columns) <= 1,
+                "{input}"
+            );
+        }
     }
 }

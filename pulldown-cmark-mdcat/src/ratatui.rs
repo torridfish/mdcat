@@ -467,6 +467,7 @@ impl Renderer<'_> {
                 math.display_mode,
                 &terminal_size,
                 &self.options.theme.math_style,
+                1,
             )?;
             let decoded = image::load_from_memory(&rendered.png).ok()?;
             let (line, start, indent) = find_text_marker(text, &math.fallback)?;

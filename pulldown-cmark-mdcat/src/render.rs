@@ -116,21 +116,28 @@ fn is_br_tag(text: &str) -> bool {
 pub use state::State;
 pub use state::StateAndData;
 
+/// Resolution multiplier for math images on kitty, relative to the terminal's cell size.
+const MATH_KITTY_SCALE: u32 = 2;
+
 fn render_math_image(
     settings: &Settings,
     math: &str,
     display_mode: bool,
 ) -> Option<math::MathImage> {
-    match settings.terminal_capabilities.image.as_ref()? {
-        ImageCapability::Kitty(_) | ImageCapability::ITerm2(_) => {}
+    let scale = match settings.terminal_capabilities.image.as_ref()? {
+        // kitty places math by cell count (see write_math_image), so it can take a
+        // higher-resolution image that stays sharp when the font is enlarged.
+        ImageCapability::Kitty(_) if settings.terminal_size.cell.is_some() => MATH_KITTY_SCALE,
+        ImageCapability::Kitty(_) | ImageCapability::ITerm2(_) => 1,
         #[cfg(feature = "sixel")]
-        ImageCapability::Sixel(_) => {}
-    }
+        ImageCapability::Sixel(_) => 1,
+    };
     math::render_math_png(
         math,
         display_mode,
         &settings.terminal_size,
         &settings.theme.math_style,
+        scale,
     )
 }
 
@@ -143,6 +150,10 @@ fn write_math_image<W: Write>(
 ) -> Result<(u16, u16, bool)> {
     let dims = (img.width_columns, img.height_rows);
     let cursor_moved = match settings.terminal_capabilities.image.as_ref() {
+        Some(ImageCapability::Kitty(k)) if settings.terminal_size.cell.is_some() => {
+            k.write_png_data_in_cells(writer, img.png, move_cursor, dims.0, dims.1)?;
+            move_cursor
+        }
         Some(ImageCapability::Kitty(k)) => {
             k.write_png_data(writer, img.png, move_cursor)?;
             move_cursor
